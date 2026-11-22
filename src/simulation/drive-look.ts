@@ -1,6 +1,6 @@
 import * as T from 'three';
 import {asset, canvasTexture, random} from './scene-kit';
-import type {Climate} from './atmosphere';
+export type Climate = "day" | "sunset" | "rain";
 
 // Calibrated from the Drive noon/sunset/night presets for the photographic skies.
 export const LOOK = {

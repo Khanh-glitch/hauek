@@ -1,8 +1,8 @@
 import {driveSurface,driveTexture} from './drive-look';
 import {DISTRICT_START, DISTRICT_BLOCK} from './q10-plan';
 import {districtFinishes} from './q10-materials';
-import {makeSurveyKit,deliveryVehicle,SURVEY} from './survey462';
-import {streetVehicles} from './vehicles';
+import {makeSurveyKit,SURVEY} from './survey462';
+import {streetVehicles, type ParkedBikeSlot} from './vehicles';
 import * as T from 'three';
 import { CURB_HEIGHT, rect, ROUTE_BOARD, STOP_SIGN, type Point, type Solid } from './boarding';
 import { ROUTE } from './transit';
@@ -207,7 +207,7 @@ function bikeMaterials() {
   return { rubber: material(0x171b1b, 0.92), gray: material(0x252929, 0.54, 0.30), chrome: material(0xa7abab, 0.44, 0.65), seat: material(0x242525, 0.84), headlight: lamp(0xe7e4cb, 0.35), brake: lamp(0x952f20, 0.45), skin: material(0xa76e50, 0.75), cloth: material(0x40574a), pants: material(0x2c3438), helmet: material(0xd3d1b5, 0.34, 0.15) };
 }
 
-export function buildStreet(scene: T.Scene, software: boolean,manager?:T.LoadingManager) {
+export function buildStreet(scene: T.Scene, software: boolean, manager?: T.LoadingManager, onAssetLoaded?: (obj: T.Object3D) => void) {
   const environment = new T.Group(); scene.add(environment);
   const solids: Solid[] = [];
   const rng = random(58200);
@@ -246,16 +246,27 @@ export function buildStreet(scene: T.Scene, software: boolean,manager?:T.Loading
   leafTexture.anisotropy = 4;
   const leaves = new T.MeshStandardMaterial({ map: leafTexture, color: 0x97ae89, side: T.DoubleSide, alphaTest: 0.51, roughness: 0.99, emissive: 0x204211, emissiveIntensity: 0.26 });
   const sway={value:0};
-  for(const surface of [leaves,wire,...canopies]){const amount=surface===leaves?.045:.012;surface.onBeforeCompile=(shader)=>{shader.uniforms.uWind=sway;shader.vertexShader='uniform float uWind;\n'+shader.vertexShader.replace('#include <begin_vertex>',`#include <begin_vertex>\n transformed.x += ${amount}*sin(uWind*1.8+position.z*1.3+position.y)*smoothstep(1.,5.,position.y);`);if(surface===leaves)shader.fragmentShader=shader.fragmentShader.replace('#include <lights_fragment_end>',`#include <lights_fragment_end>
+  const windAmp={value:1};
+  for(const surface of [leaves,wire,...canopies]){const amount=surface===leaves?.045:.012;surface.onBeforeCompile=(shader)=>{shader.uniforms.uWind=sway;shader.uniforms.uWindAmp=windAmp;shader.vertexShader='uniform float uWind, uWindAmp;\n'+shader.vertexShader.replace('#include <begin_vertex>',`#include <begin_vertex>\n transformed.x += ${amount}*uWindAmp*sin(uWind*1.8+position.z*1.3+position.y)*smoothstep(1.,5.,position.y);`);if(surface===leaves)shader.fragmentShader=shader.fragmentShader.replace('#include <lights_fragment_end>',`#include <lights_fragment_end>
 #if NUM_DIR_LIGHTS > 0
 float thin=max(0.,dot(-normal,directionalLights[0].direction));reflectedLight.indirectDiffuse+=diffuseColor.rgb*vec3(.21,.28,.09)*thin;
 #endif`);};surface.customProgramCacheKey=()=>`sway-${amount}`;}
+  // Pre-bind 1×1 neutral DataTexture on shopfronts so async shopfronts.jpg load NEVER triggers runtime shader recompile!
+  const shopPlaceholder = new T.DataTexture(new Uint8Array([92, 88, 82, 255]), 1, 1);
+  shopPlaceholder.colorSpace = T.SRGBColorSpace;
+  shopPlaceholder.needsUpdate = true;
   const shopfronts = [material(0x746f5d, 0.88), material(0x6a7771, 0.88)];
+  for (const sf of shopfronts) {
+    sf.map = shopPlaceholder;
+    sf.emissiveMap = shopPlaceholder;
+  }
   loader.load(asset('shopfronts.jpg'), (map) => {
     map.colorSpace = T.SRGBColorSpace; map.anisotropy = 4;
     [0.006, 0.504].forEach((x, i) => {
       const slice = map.clone(); slice.offset.x = x; slice.repeat.x = 0.486;
-      shopfronts[i].color.set(0xe6e1d6); shopfronts[i].map = slice; shopfronts[i].needsUpdate = true;
+      shopfronts[i].color.set(0xdcd7cc);
+      shopfronts[i].map = slice;
+      shopfronts[i].emissiveMap = slice;
     });
   });
   const finishes=districtFinishes(loader);
@@ -279,13 +290,26 @@ float thin=max(0.,dot(-normal,directionalLights[0].direction));reflectedLight.in
   const busBay=decal('bay-map'),zebra=decal('crossing-map'),scraps=decal('street-scraps');
 
   plane(environment, [-WIDTH / 2, -0.001, CENTRE], [WIDTH + 0.02, ROAD_LENGTH], asphalt, 0, X_ANGLE);
-  for (const x of [3.4, -WIDTH-3.4]) {
-    box(environment, [x, 0.068, CENTRE], [6.8, 0.145, ROAD_LENGTH], concrete, false);
-    plane(environment, [x, CURB_HEIGHT, CENTRE], [6.8, ROAD_LENGTH], x>0?paving:slab, 0, X_ANGLE);
+  // West sidewalk runs continuously; East sidewalk opens cleanly at both East Boulevards (Z=-76 & Z=-147, width 12m)
+  box(environment, [-WIDTH - 3.4, 0.068, CENTRE], [6.8, 0.145, ROAD_LENGTH], concrete, false);
+  plane(environment, [-WIDTH - 3.4, CURB_HEIGHT, CENTRE], [6.8, ROAD_LENGTH], slab, 0, X_ANGLE);
+  for (const [z0, z1] of [
+    [STREET_MIN, -153],
+    [-141, -82],
+    [-70, STREET_MAX],
+  ] as const) {
+    const len = z1 - z0;
+    const mid = (z0 + z1) * 0.5;
+    box(environment, [3.4, 0.068, mid], [6.8, 0.145, len], concrete, false);
+    plane(environment, [3.4, CURB_HEIGHT, mid], [6.8, len], paving, 0, X_ANGLE);
   }
   const curb = new T.Group(); environment.add(curb);
   for (let z = STREET_MIN; z < STREET_MAX; z += 0.70) {
-    for (const x of [0.075, -WIDTH - 0.075]) box(curb, [x, 0.106, z], [0.15, 0.107, 0.687], rng() < 0.20 ? concrete : pale, false).receiveShadow = true;
+    const inEastBlvd = Math.abs(z + 76) < 6.3 || Math.abs(z + 147) < 6.3;
+    for (const x of [0.075, -WIDTH - 0.075]) {
+      if (x > 0 && inEastBlvd) continue;
+      box(curb, [x, 0.106, z], [0.15, 0.107, 0.687], rng() < 0.20 ? concrete : pale, false).receiveShadow = true;
+    }
   }
   for (let z = STREET_MIN + 1; z < STREET_MAX; z += 5.6) {
     if ([-76, -96, -147].some((crossing) => Math.abs(crossing - z) < 5)) continue;
@@ -440,6 +464,7 @@ float thin=max(0.,dot(-normal,directionalLights[0].direction));reflectedLight.in
 
   const paintColors = [0x782e29, 0x52686c, 0xaab1a6, 0x5a4c37, 0x434748].map((color) => material(color, 0.34, 0.31));
   const trim = bikeMaterials();
+  const parkedBikeSlots: ParkedBikeSlot[] = [];
   const surveyStucco=driveTexture(loader,"stucco-map");const kit=makeSurveyKit(surveyStucco,shopfronts,finishes,software?null:driveTexture(loader,"stucco-normal",false));
   const blocks: { group: T.Group; far:T.Group; start: number }[] = [];
   for (let j = 0; j < 14; j++) {
@@ -450,7 +475,7 @@ float thin=max(0.,dot(-normal,directionalLights[0].direction));reflectedLight.in
       const authored=kit.block(j,start,side,block,far,solids);
       if(!authored)for (let k = 0; k < 4; k++) {
         const z = start + 2.43 + k * 5.15;
-        const roadGap = [-76, -96, -147].some((crossing) => Math.abs(z - crossing) < 2.75);
+        const roadGap = [-76, -96, -147].some((crossing) => Math.abs(z - crossing) < (side === 1 && (crossing === -76 || crossing === -147) ? 13.0 : 2.75));
         if (roadGap) continue;
         house(block, side === 1 ? 5.53 + rng() * 0.46 : -16.04 - rng() * 0.48, z, (j + k * 2 + (side === 1 ? 0 : 3)) % shopNames.length, 4.96 + rng() * 0.12, side, 1 + Math.floor(rng() * 4));
       }
@@ -460,64 +485,72 @@ float thin=max(0.,dot(-normal,directionalLights[0].direction));reflectedLight.in
        // Irregular crowns open sightlines to the trading bays, not paired avenue trees.
        const offset=side>0?0:2.7;tree(block,tx,start+4.1+offset,j%3===1?1.46:1.17);
        if(side<0 || j!==7)tree(block,tx+side*.42,start+15.3-offset,j%2===0?.92:1.21);if(j%2===0){const lx=side>0?.85:-WIDTH-.85;kit.lampPost(block,lx,start+8,side);solids.push(rect(lx,start+8,.22,.22));}}
-      else tree(block, x, z, 0.78 + rng() * 0.53);
-      if (!authored && (j % 2 === 0 || side === -1)) tree(block, side === -1 ? -13.62 : 4.55, z + 9, 0.62 + rng() * 0.56);
-      if (z > -9 && z < 6 || z > -138 && z < -122) continue;
+      else if (!(side === 1 && (Math.abs(z + 76) < 11.2 || Math.abs(z + 147) < 11.2))) tree(block, x, z, 0.78 + rng() * 0.53);
+      if (!authored && (j % 2 === 0 || side === -1) && !(side === 1 && (Math.abs(z + 9 + 76) < 11.2 || Math.abs(z + 9 + 147) < 11.2))) tree(block, side === -1 ? -13.62 : 4.55, z + 9, 0.62 + rng() * 0.56);
+      if (z > -15 && z < 6 || z > -138 && z < -122 || (side === 1 && (Math.abs(z + 76) < 11.5 || Math.abs(z + 147) < 11.5))) continue;
       for (let k = 0; k < (authored && j===7 && side>0 ? 6 : 1 + (j + side + 1) % 3); k++) {
         const bx = side === 1 ? (j===7?2.95:4.61) : -14.77, bz = (j===7 && side>0?start+7:z) + 1.45 + k * 0.91;
-        const parked = scooter(block, paintColors[(k + j) % paintColors.length], false, trim);
-        parked.position.set(bx, 0.167, bz);
-        parked.rotation.set(0, side * (1.11 + rng() * 0.42), -0.07);
+        if (side === 1 && (Math.abs(bz + 76) < 10.8 || Math.abs(bz + 147) < 10.8)) continue;
+        // Replaced crude procedural box scooters with REAL 3D GLB motorbikes (PCX / Super Cub / PBR motorbike)!
+        parkedBikeSlots.push({ parent: block, x: bx, y: 0.167, z: bz, ry: side * (1.11 + rng() * 0.42) });
         solids.push(rect(bx, bz, 1.53, 0.50));
         contact(block, bx, 0.176, bz, 1.87, 0.89, shade);
       }
     }
     const here = start + 2.15;
-    powerPole(block, 4.72, here);
+    if (Math.abs(here + 76) >= 7.0 && Math.abs(here + 147) >= 7.0) powerPole(block, 4.72, here);
     if (j < 13) for (let k = 0; k < 7; k++) {
       const x = 4.72 + (k - 3) * 0.12, y = k < 4 ? 6.34 + k * 0.047 : 7.23 + (k - 5) * 0.047;
       const cable = tube(block, [[x, y, here], [x - 0.32, y - 0.43, here + 6.1], [x - 0.38, y - 0.52, here + 12.2], [x, y, here + 21]], k < 3 ? 0.019 : 0.012, wire, 10);
       cable.castShadow = false;
     }
-    if ((j<6 || j>10) && j % 3 === 1) for (let k = 0; k < 4; k++) {
+    if ((j<6 || j>10) && j % 3 === 1 && Math.abs(here + 76) >= 7.0 && Math.abs(here + 147) >= 7.0) for (let k = 0; k < 4; k++) {
       const z = here + k * 0.13;
       const cable = tube(block, [[4.72, 6.43 + k * 0.10, z], [-2, 5.94 + k * 0.10, z + 0.71], [-9.5, 6.17 + k * 0.1, z + 2.08], [-16.35, 7.29, z + 3.10]], 0.016, wire, 12);
       cable.castShadow = false;
     }
-    for(const side of [1,-1]){const xx=side===1?1.7:-12.95,zz=start+6.2;rod(far,[xx,.16,zz],[xx,4.68,zz],.14,bark,.07,5);for(let i=0;i<3;i++){const card=plane(far,[xx,4.88,zz],[5.7,3.7],leaves,i*Math.PI/3);card.castShadow=false;}}
+    for(const side of [1,-1]){
+      const xx=side===1?1.7:-12.95,zz=start+6.2;
+      if (side === 1 && (Math.abs(zz + 76) < 10.5 || Math.abs(zz + 147) < 10.5)) continue;
+      rod(far,[xx,.16,zz],[xx,4.68,zz],.14,bark,.07,5);
+      for(let i=0;i<3;i++){const card=plane(far,[xx,4.88,zz],[5.7,3.7],leaves,i*Math.PI/3);card.castShadow=false;}
+    }
     batch(far);far.visible=false;batch(block);
   }
 
   const dressing = new T.Group(); environment.add(dressing);
-  for (let i = 0; i < 22; i++) {
-    const z = -187 + rng() * 234;
-    const side = i % 2 ? 1 : -1;
-    const x = side > 0 ? 14 + rng() * 20 : -23 - rng() * 22;
-    const w = 5 + rng() * 10, h = 11 + rng() * 14;
-    box(dressing, [x, h * 0.50, z], [w, h, 6 + rng() * 9], pales[i % pales.length]);
-    if (i % 3 === 1) for (let j = 0; j < 4; j++) box(dressing, [x - side * (w * 0.5 + 0.09), h - 0.8 - j * 1.22, z], [0.15, 0.29, 5], balconyGlass);
+  // Keep ONLY west-side background depth blocks well clear of west shophouses (x < -28);
+  // all East-side & North urban districts are cleanly authored in saigonDistricts.ts with zero overlaps!
+  for (let i = 0; i < 12; i++) {
+    const z = -175 + i * 19.5;
+    const x = -29 - (i % 3) * 6;
+    const w = 8 + (i % 3) * 2.5, h = 11 + (i % 4) * 3.5;
+    box(dressing, [x, h * 0.50, z], [w, h, 10], pales[i % pales.length]);
+    plane(dressing, [x + w * 0.5 + 0.04, h * 0.5, z], [10, h], skyline[i % 2], Math.PI / 2);
   }
   for(let i=0;i<29;i++)plane(dressing,[i%2?-.4:.67,.013+(i%2?0:.155),-159+i*8.2],[.56,.68],scraps,0,X_ANGLE);
-  // Receding blocks beyond the playable boundary. Layer the roofline rather than
-  // terminating the avenue against sky at the LOD cut (massing is inferred).
-  for(const dir of [-1,1])for(let i=0;i<7;i++){
-    const z=dir>0?70+i*7:-138-i*7;
-    for(const side of [-1,1]){const x=-WIDTH/2+side*(10+i*.48),h=7+(i*7+(side+1)*3)%15;
-    box(dressing,[x,h/2,z],[6,h,6.7],pales[(i+side+2)%pales.length]);
-    plane(dressing,[x,h*.5,z-dir*3.36],[5.9,h],skyline[i%2],dir>0?Math.PI:0);plane(dressing,[x-side*3.01,h*.5,z],[6.65,h],skyline[i%2],side*X_ANGLE);}
-  }
-  for(const [x,h,w,z] of [[-6,23,4,118],[1,26,6,124],[-16,18,6,115],[7,19,8,110],[-8,16,5,-164]]){
-    box(dressing,[x,h*.5,z],[w,h,8],pales[1]);plane(dressing,[x,h*.5,z-Math.sign(z)*4.02],[w,h],skyline[1],z>0?Math.PI:0);
+  // Receding south skyline strictly beyond playable south boundary (z >= 96) and well off the roadway!
+  for (let i = 0; i < 6; i++) {
+    const z = 104 + i * 8;
+    for (const side of [-1, 1]) {
+      const x = side > 0 ? 10.5 + i * 0.5 : -23.5 - i * 0.5;
+      const h = 9 + ((i * 7 + (side + 1) * 3) % 14);
+      box(dressing, [x, h / 2, z], [6.5, h, 6.8], pales[(i + side + 2) % pales.length]);
+      plane(dressing, [x, h * 0.5, z - 3.42], [6.4, h], skyline[i % 2], Math.PI);
+      plane(dressing, [x - side * 3.27, h * 0.5, z], [6.7, h], skyline[i % 2], side * X_ANGLE);
+    }
   }
   const signalColours=[0xe94b37,0xf1ae40,0x58bf78].map(c=>lamp(c,0));
   for (const z of [-76, -96, -147]) for (const side of [1, -1]) {
     const x = side === 1 ? 0.73 : -12.51;
-    rod(dressing, [x, 0.16, z - 2.6], [x, 4.15, z - 2.6], 0.065, darkMetal);
-    box(dressing, [x - side * 0.19, 3.65, z - 2.6], [0.34, 0.81, 0.31], charcoal);
+    // Place east-side traffic signal on the corner sidewalk cleanly outside the 12m cross-boulevard mouth!
+    const sz = side === 1 && (z === -76 || z === -147) ? z + 7.2 : z - 2.6;
+    rod(dressing, [x, 0.16, sz], [x, 4.15, sz], 0.065, darkMetal);
+    box(dressing, [x - side * 0.19, 3.65, sz], [0.34, 0.81, 0.31], charcoal);
     for (const [i, light] of signalColours.entries()) {
-      orb(dressing, [x - side * 0.36, 3.9 - i * 0.25, z - 2.61], [0.037, 0.083, 0.085], light);
+      orb(dressing, [x - side * 0.36, 3.9 - i * 0.25, sz - 0.01], [0.037, 0.083, 0.085], light);
     }
-    solids.push(rect(x, z - 2.6, 0.19, 0.20));
+    solids.push(rect(x, sz, 0.19, 0.20));
   }
   const leafStain = [material(0x514d32), material(0x78694a), material(0x87805b)];
   const wear = label(384, 192, (ctx) => {
@@ -575,17 +608,23 @@ float thin=max(0.,dot(-normal,directionalLights[0].direction));reflectedLight.in
 
   const car=new T.Group();environment.add(car);car.position.set(-10.45,0,-88);traffic.push({body:car,x:-10.45,direction:1,speed:7.4});
   const parkedMPV=new T.Group();parkedMPV.position.set(-WIDTH+1.02,0,-12.5);environment.add(parkedMPV);solids.push(rect(parkedMPV.position.x,-12.5,1.87,4.49));
-  const fleet=streetVehicles(traffic,parkedMPV);
-  const van=deliveryVehicle(false);batch(van);van.rotation.y=Math.PI;van.position.set(-WIDTH+.98,0,-34);environment.add(van);solids.push(rect(van.position.x,-34,1.9,4.6));
-  const truck=deliveryVehicle(true);batch(truck);truck.position.set(-4.78,0,-30);environment.add(truck);traffic.push({body:truck,x:-4.73,direction:-1,speed:4.2});
+  const van=new T.Group();van.position.set(-WIDTH+.98,0,-34);environment.add(van);solids.push(rect(van.position.x,-34,1.9,4.6));
+  const truck=new T.Group();truck.position.set(-4.78,0,-30);environment.add(truck);traffic.push({body:truck,x:-4.73,direction:-1,speed:4.2});
+  const fleet=streetVehicles(traffic,parkedMPV,van,truck,parkedBikeSlots,onAssetLoaded);
   const velocities=traffic.map(t=>t.speed);
-  return { solids,dispose(){fleet.dispose();},wet(value:boolean,wetness:number){kit.lights(wetness);lightbox.emissiveIntensity=.12+wetness*.72;for(const m of skyline)m.emissiveIntensity=.02+wetness*.95;paving.roughness=slab.roughness=.91-wetness*.44;for(const m of [...shopNames,...choLonSigns,...shopfronts,periodFacade]){if(m instanceof T.MeshStandardMaterial){m.emissiveMap=m.map;m.emissive.set(value?0xffcea4:0x000000);m.emissiveIntensity=m===periodFacade?.12:shopfronts.includes(m)?.22:1.6;m.needsUpdate=true;}}
-      asphalt.roughness=.89-wetness*.57;asphalt.metalness=.02+wetness*.36;asphalt.color.set(value?0x788999:0xffffff);balconyGlass.emissive.set(value?0xa17b44:0x000000);balconyGlass.emissiveIntensity=.45;},update(dt: number, player: Point, time: number) {
+  // Pre-bind emissiveMap at build time so street.wet() NEVER triggers runtime shader recompilation!
+  for (const m of [...shopNames, ...choLonSigns, ...shopfronts, periodFacade]) {
+    if (m instanceof T.MeshStandardMaterial) {
+      m.emissiveMap = m.map;
+    }
+  }
+  return { solids, blocks, environment, setWind(strength: number) { windAmp.value = strength; }, dispose(){fleet.dispose();},wet(value:boolean,wetness:number){kit.lights(wetness);leaves.emissiveIntensity=value?0.012:0.12;leaves.color.set(value?0x4d5e49:0x8fa67e);lightbox.emissiveIntensity=.12+wetness*.72;for(const m of skyline)m.emissiveIntensity=.02+wetness*.95;paving.roughness=slab.roughness=.91-wetness*.44;for(const m of [...shopNames,...choLonSigns,...shopfronts,periodFacade]){if(m instanceof T.MeshStandardMaterial){if(m.map&&m.emissiveMap!==m.map){m.emissiveMap=m.map;m.needsUpdate=true;}m.emissive.set(value?0xffcea4:0x000000);m.emissiveIntensity=m===periodFacade?.14:shopfronts.includes(m)?(m.map?.32:0.0):1.35;}}
+      asphalt.roughness=.89-wetness*.57;asphalt.metalness=.02+wetness*.36;asphalt.color.set(value?0x8a9aa8:0xd4d8dc);balconyGlass.emissive.set(value?0xa17b44:0x000000);balconyGlass.emissiveIntensity=.45;},update(dt: number, player: Point, time: number, skipBlockCull = false) {
     fleet.update();sway.value=time;if(rotor instanceof T.MeshStandardMaterial)rotor.map!.rotation=time*5;
     const tick=time%22;const signal=tick<10?2:tick<12?1:0;
     for(let i=0;i<3;i++){signalColours[i].color.setScalar(signal===i?.25:.015);signalColours[i].emissiveIntensity=signal===i?1.8:.025;}
 
-    for(const {group,far,start} of blocks){const d=Math.max(0,Math.abs(start+10.5-player.z)-10.5);group.visible=d<(software?24:43);far.visible=!group.visible && d<150;}
+    if (!skipBlockCull) for(const {group,far,start} of blocks){const d=Math.max(0,Math.abs(start+10.5-player.z)-10.5);group.visible=d<(software?24:43);far.visible=!group.visible && d<150;}
     for (const [i, scooter] of traffic.entries()) {
       const { body, direction, speed } = scooter;
       const ahead = (player.z - body.position.z) * direction;

@@ -160,14 +160,15 @@ export function makeSurveyKit(
       for (const g of [near, far]) {
         const low = g === far;
         if (k === "hem") {
-          // A passage between party walls, with a dogleg: no shop or sign painted over its mouth.
+          const openToBoardingHouse = index === 8 && side === 1;
+          // A passage between party walls; Block 8 East opens seamlessly into Dãy Trọ 462/14.
           bx(g, -4.2, 0.143, 0, 8.5, 0.035, w, shade);
-          bx(g, -9, 2.2, 0, 0.28, 4.4, w, mint);
+          if (!openToBoardingHouse) bx(g, -9, 2.2, 0, 0.28, 4.4, w, mint);
           for (const f of [-1, 1]) {
             bx(g, -4, 2.82, w * f * 0.49, 8.6, 5.64, 0.14, wallMat);
             bx(g, -3.7, 1.35, w * f * 0.46, 8.2, 0.12, 0.09, steel);
           }
-          bx(g, -7, 1.85, w * 0.25, 0.22, 3.7, w * 0.55, door);
+          if (!openToBoardingHouse) bx(g, -7, 1.85, w * 0.25, 0.22, 3.7, w * 0.55, door);
           if (!low) {
             for (const d of [1.8, 4.9]) bx(g, -d, 3.3, 0, 0.045, 0.04, w, dark);
           }
@@ -192,7 +193,10 @@ export function makeSurveyKit(
           continue;
         }
         // Step the main mass back behind an open shop bay. Deep canopy creates a real soffit shadow.
-        bx(g, -5.3, h / 2, 0, 7.8, h, w - 0.055, wallMat);
+        // Keep Block 8 East rear wall cleanly flush behind Dãy Trọ 462/14's west wall (x = 13.25) so ZERO geometry pokes into the courtyard!
+        const massDepth = index === 8 && side === 1 ? Math.max(4.5, 13.1 - (front + 1.4)) : 7.8;
+        const massOffset = -(1.4 + massDepth * 0.5);
+        bx(g, massOffset, h / 2, 0, massDepth, h, w - 0.055, wallMat);
         const recessed = k === "loggia";
         if (recessed) {
           for (const f of [-1, 1])
@@ -413,9 +417,10 @@ export function makeSurveyKit(
         bx(g, 0.14, h - 0.04, 0, 0.44, 0.16, w + 0.04, cream);
       }
       if (k === "hem") {
+        const openToBoardingHouse = index === 8 && side === 1;
         for (const f of [-1, 1])
           solids.push(rect(face(-4), z + w * f * 0.49, 8.6, 0.14));
-        solids.push(rect(face(-7), z, 0.27, w));
+        if (!openToBoardingHouse) solids.push(rect(face(-7), z, 0.27, w));
       } else {
         solids.push(rect(front + side * 5.3, z, 7.8, w));
         if (k === "shutter") solids.push(rect(face(-0.26), z, 0.13, w - 0.37));

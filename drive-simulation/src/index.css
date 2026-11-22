@@ -1,9 +1,0 @@
-@import "tailwindcss";
-@import "@fontsource/barlow-condensed/700.css";
-@import "@fontsource/inter/400.css";
-@import "@fontsource/inter/600.css";
-html, body, #root { margin: 0; height: 100%; background: #05070a; overflow: hidden; font-family: Inter, system-ui, sans-serif; color: #e8edf2; }
-.glass { background: rgba(10,14,20,.62); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,.1); border-radius: 14px; }
-.kbd { display:inline-block; padding:0 6px; border-radius:5px; border:1px solid rgba(255,255,255,.25); background:rgba(255,255,255,.08); font-size:11px; font-family:ui-monospace,monospace; }
-.title { font-family: "Barlow Condensed", Impact, sans-serif; letter-spacing: .04em; }
-input[type=range]{ accent-color:#ffb020; }
