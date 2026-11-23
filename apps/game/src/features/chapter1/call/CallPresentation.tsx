@@ -1,0 +1,327 @@
+// Call presentation wiring for the `call` overlay (design.md, "`CallPresentation.tsx` (wiring)").
+// DOM only: no three, React Three Fiber or Drei imports. The 3D phone is rendered by
+// `ChapterOneCanvas`; this component reads its projected screen rectangle through the
+// `PhoneScreenSink` and places the single `PhoneCallScreen` instance in `PhoneScreenHost`.
+//
+// - Reads `state.call` and `selectDialogueView(state, scenario)` through `useChapterState`. It
+//   creates no store and holds no dialogue state (Req 4.8, 11.8); every change goes through the
+//   page handlers.
+// - Mode: `pending` -> `model` on the first non-null sink rectangle, `pending` -> `fallback`
+//   after 200 ms, `model` -> `fallback` when the sink publishes `null` or `modelAllowed` turns
+//   false. A rectangle received later moves `fallback` back to `model` while the model is allowed.
+// - Single dispatch guard keyed on `${call.current}:${call.status}` (Req 5.7).
+// - `paused` disables every control and turns off number keys; initial focus is Accept while
+//   ringing, the first option while active with options (from `PlayerChoiceOverlay`), Hang up
+//   otherwise; no focus change while paused. No Escape handling (the page owns it, Req 7.5).
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { selectDialogueView } from "../../../game/narrative/selectors";
+import type { ChapterStore } from "../../../game/narrative/store";
+import type { ChapterState, ScenarioDefinition } from "../../../game/narrative/types";
+import type { VoiceSnapshot } from "../../../game/voice/VoiceDialoguePlayer";
+import { usePrefersReducedMotion } from "../../../components/ui/usePrefersReducedMotion";
+import { CINE } from "../theme";
+import { useChapterState } from "../useChapterState";
+import { deriveCallDialogueView, isSubtitleVisible } from "./callDialogueView";
+import { computeCallLayout } from "./callLayout";
+import type { Rect } from "./callLayout";
+import { CallSubtitleOverlay } from "./CallSubtitleOverlay";
+import { PhoneCallScreen } from "./PhoneCallScreen";
+import type { CallControlsView } from "./PhoneCallScreen";
+import { PhoneScreenHost } from "./PhoneScreenHost";
+import type { PhoneScreenSink } from "./phoneScreenSink";
+import { PlayerChoiceOverlay } from "./PlayerChoiceOverlay";
+import { useTypewriter } from "./useTypewriter";
+import { useViewport } from "./useViewport";
+
+export type PresentationMode = "pending" | "model" | "fallback";
+
+export interface CallPresentationProps {
+  store: ChapterStore;
+  /** Display scenario from `useDisplayScenario`. */
+  scenario: ScenarioDefinition;
+  paused: boolean;
+  /** WebGL available, no context loss, model not failed. */
+  modelAllowed: boolean;
+  screenSink: PhoneScreenSink;
+  /** The page's `handleAnswerCall`. */
+  onAnswer: () => void;
+  /** The page's `handleEndCall`. */
+  onEnd: () => void;
+  /** The page's `handleSelectOption`. */
+  onSelectOption: (optionId: string) => void;
+  /**
+   * Optional voice state from `useVoicePlayback` (the page owns the hook). Absent: the call
+   * screen renders exactly as before. This component only reads it; it holds no voice state.
+   */
+  voice?: CallVoiceProps;
+  /** Whole seconds of the active call from `useCallDuration`. Default 0. */
+  durationSeconds?: number;
+  /** The Subtitles setting. Captions also show whenever nothing is audible. */
+  subtitlesEnabled?: boolean;
+  /** Speaker toggle state. Absent: the Speaker button is off and does nothing. */
+  speaker?: { on: boolean; onToggle: () => void };
+  /** Plays the hover sound when the reply highlight moves. */
+  onHoverSound?: () => void;
+}
+
+/** The pieces of the `VoiceController` this component needs. */
+export interface CallVoiceProps {
+  snapshot: VoiceSnapshot;
+  muted: boolean;
+  /** Called inside the Answer click, a user gesture. */
+  unlock: () => Promise<void>;
+  replay: () => void;
+  setMuted: (muted: boolean) => void;
+  optionsWaiting: boolean;
+  skipWait: () => void;
+}
+
+/** Height below which the phone screen uses the compact layout (design.md, section 6). */
+const COMPACT_SCREEN_HEIGHT = 360;
+
+type VoiceNotice = "none" | "autoplay-blocked" | "dev-preview" | "english-voice" | "no-audio";
+
+function voiceNotice(snapshot: VoiceSnapshot): VoiceNotice {
+  if (snapshot.reason === "autoplay-blocked" || snapshot.phase === "blocked") return "autoplay-blocked";
+  if (snapshot.label === "dev-preview") return "dev-preview";
+  if (snapshot.label === "english-voice") return "english-voice";
+  if (snapshot.source === "none" && (snapshot.phase === "unavailable" || snapshot.phase === "failed")) {
+    return "no-audio";
+  }
+  return "none";
+}
+
+/** Time to wait for the first projected rectangle before showing the 2D fallback. */
+const PENDING_GRACE_MS = 200;
+/**
+ * The same wait when the 3D phone is already loaded and compiled (`screenSink.isWarm()`): the
+ * rectangle comes with its first frame, so a slow frame must not flash the 2D screen first. A
+ * model that fails or a lost context still falls back at once (`modelAllowed` turns false).
+ */
+const WARM_PENDING_GRACE_MS = 1500;
+
+const callSelector = (state: ChapterState) => state.call;
+
+export const CallPresentation: React.FC<CallPresentationProps> = ({
+  store,
+  scenario,
+  paused,
+  modelAllowed,
+  screenSink,
+  onAnswer,
+  onEnd,
+  onSelectOption,
+  voice,
+  durationSeconds = 0,
+  subtitlesEnabled = true,
+  speaker,
+  onHoverSound,
+}) => {
+  const { t } = useTranslation("chapter1");
+  const call = useChapterState(store, callSelector);
+  const dialogueSelector = useCallback(
+    (state: ChapterState) => selectDialogueView(state, scenario),
+    [scenario],
+  );
+  const dialogueView = useChapterState(store, dialogueSelector);
+
+  // Memoized on the viewport identity so `PhoneScreenHost` does not resubscribe every render.
+  const viewport = useViewport();
+  const layout = useMemo(() => computeCallLayout(viewport), [viewport]);
+
+  // --- Presentation mode ---------------------------------------------------------------------
+  const [mode, setMode] = useState<PresentationMode>(() =>
+    modelAllowed ? (screenSink.current() !== null ? "model" : "pending") : "fallback",
+  );
+  const modeRef = useRef(mode);
+  useLayoutEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  useEffect(() => {
+    if (!modelAllowed) {
+      setMode("fallback");
+      return undefined;
+    }
+    const apply = (rect: Rect | null) => {
+      // The sink publishes every frame; skip the state update when nothing changes.
+      if (rect !== null) {
+        if (modeRef.current !== "model") setMode("model");
+      } else if (modeRef.current === "model") {
+        setMode("fallback");
+      }
+    };
+    apply(screenSink.current());
+    return screenSink.subscribe(apply);
+  }, [modelAllowed, screenSink]);
+
+  useEffect(() => {
+    if (mode !== "pending") return undefined;
+    const timer = window.setTimeout(() => {
+      setMode((current) => (current === "pending" ? "fallback" : current));
+    }, screenSink.isWarm() ? WARM_PENDING_GRACE_MS : PENDING_GRACE_MS);
+    return () => window.clearTimeout(timer);
+  }, [mode, screenSink]);
+
+  // --- Derived view --------------------------------------------------------------------------
+  const callDef = call.current !== null ? scenario.calls[call.current] : undefined;
+  const { screen: screenView, subtitle, narration } = deriveCallDialogueView({
+    call,
+    callDef,
+    dialogueView,
+  });
+  const linkedView =
+    dialogueView !== null && call.current !== null && dialogueView.callId === call.current
+      ? dialogueView
+      : null;
+
+  // --- Single dispatch guard -----------------------------------------------------------------
+  const callKey = `${call.current}:${call.status}`;
+  const handledRef = useRef<string | null>(null);
+  useEffect(() => {
+    // A new call or status allows the next button press (for example a call that rings again).
+    if (handledRef.current !== callKey) handledRef.current = null;
+  }, [callKey]);
+
+  const guarded = (handler: () => void) => () => {
+    if (paused || call.current === null) return;
+    if (handledRef.current === callKey) return;
+    handledRef.current = callKey;
+    handler();
+  };
+
+  // --- Initial focus -------------------------------------------------------------------------
+  const acceptRef = useRef<HTMLButtonElement>(null);
+  const hangUpRef = useRef<HTMLButtonElement>(null);
+  const hasOptions = linkedView !== null && linkedView.options.length > 0;
+  useEffect(() => {
+    if (paused) return;
+    if (call.status === "ringing") {
+      acceptRef.current?.focus();
+    } else if (call.status === "active" && !hasOptions) {
+      // With options, `PlayerChoiceOverlay` focuses the first option itself.
+      hangUpRef.current?.focus();
+    }
+  }, [call.status, linkedView?.graphId, linkedView?.nodeId, hasOptions, paused]);
+
+  const controls: CallControlsView | undefined =
+    voice !== undefined && call.status === "active"
+      ? {
+          durationSeconds,
+          muted: voice.muted,
+          replayEnabled: voice.snapshot.source !== "none",
+          speakerOn: speaker?.on ?? false,
+          compact: layout.screen.height < COMPACT_SCREEN_HEIGHT,
+        }
+      : undefined;
+
+  const subtitleVisible = isSubtitleVisible({
+    subtitlesEnabled,
+    audible: voice?.snapshot.audible,
+  });
+
+  // The caller line types out. Replies appear as soon as it is fully revealed; F or a click while it
+  // types shows the rest at once.
+  const reducedMotion = usePrefersReducedMotion();
+  const typedLine =
+    call.status === "active" && subtitleVisible && subtitle.kind === "line" ? subtitle : null;
+  // The line types over the length of its generated voice clip. Without one (muted, missing, not
+  // loaded yet) it uses the fixed speed.
+  const clipDurationMs =
+    voice !== undefined &&
+    typedLine !== null &&
+    !voice.muted &&
+    voice.snapshot.source === "clip" &&
+    voice.snapshot.targetKey === typedLine.nodeKey
+      ? voice.snapshot.durationMs
+      : null;
+  const typing = useTypewriter(
+    typedLine === null ? "" : `${typedLine.nodeKey}:${typedLine.text}`,
+    typedLine === null ? null : typedLine.text,
+    reducedMotion,
+    clipDurationMs,
+  );
+  const typingActive = typedLine !== null && !typing.complete;
+  const skipTyping = typing.skip;
+  useEffect(() => {
+    if (!typingActive || paused) return undefined;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.code === "KeyF") {
+        event.preventDefault();
+        skipTyping();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [typingActive, paused, skipTyping]);
+
+  if (screenView === null) return null;
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={t("phone.callPresentation.name")}
+      className="fixed inset-0 z-40"
+      data-testid="call-presentation"
+      data-mode={mode}
+      onClick={(event) => {
+        // A click anywhere (not on a button) shows the rest of the line being typed.
+        if (typingActive && !paused && !(event.target as Element).closest("button")) skipTyping();
+      }}
+    >
+      {mode !== "model" && <div className="absolute inset-0 bg-[#171521]/70" aria-hidden="true" />}
+      {/* Soft vignette over the room behind the 3D phone. CSS only: no per-frame cost. */}
+      {mode === "model" && (
+        <div
+          className="pointer-events-none absolute inset-0"
+          aria-hidden="true"
+          data-testid="call-vignette"
+          style={{ background: CINE.color.vignette }}
+        />
+      )}
+      <PhoneScreenHost mode={mode} layout={layout} screenSink={screenSink}>
+        <PhoneCallScreen
+          view={screenView}
+          disabled={paused}
+          vibrateIcon={mode === "fallback"}
+          controls={controls}
+          onToggleMute={voice ? () => voice.setMuted(!voice.muted) : undefined}
+          onToggleSpeaker={speaker?.onToggle}
+          onReplay={voice ? voice.replay : undefined}
+          onAccept={guarded(() => {
+            // Unlock audio inside the click gesture; failure never blocks the call.
+            if (voice !== undefined) void voice.unlock().catch(() => undefined);
+            onAnswer();
+          })}
+          onDecline={guarded(onEnd)}
+          onHangUp={guarded(onEnd)}
+          acceptRef={acceptRef}
+          hangUpRef={hangUpRef}
+        />
+      </PhoneScreenHost>
+      {call.status === "active" ? (
+        <CallSubtitleOverlay
+          content={subtitle}
+          visible={subtitleVisible}
+          notice={voice !== undefined ? voiceNotice(voice.snapshot) : "none"}
+          region={layout.subtitle}
+          revealedChars={typedLine === null ? undefined : typing.count}
+        />
+      ) : null}
+      {call.status === "active" && linkedView !== null ? (
+        <PlayerChoiceOverlay
+          view={linkedView}
+          narration={narration}
+          disabled={paused}
+          onSelectOption={onSelectOption}
+          waiting={typingActive}
+          region={layout.choice}
+          onHoverSound={onHoverSound}
+        />
+      ) : null}
+    </div>
+  );
+};
