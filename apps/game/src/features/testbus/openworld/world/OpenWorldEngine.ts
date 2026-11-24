@@ -1,4 +1,5 @@
 import * as T from "three";
+import { tr } from "../strings";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
@@ -10,11 +11,37 @@ import { createRainGlass } from "../room/glass";
 import { AudioEngine } from "../room/audio";
 import { canvas as makeRoomCanvas, dropMaskCanvas, paintDropMask, toTex } from "../room/textures";
 
-import { CURB_HEIGHT, rect, type Solid } from "../simulation/boarding";
+import {
+  blocksBus,
+  BUS_DOORS,
+  CURB_HEIGHT,
+  floorAt as busFloorAt,
+  isInside as insideBus,
+  rect,
+  seatBase,
+  seats as BUS_SEATS,
+  toLocal as busToLocal,
+  toWorld as busToWorld,
+  type PassengerSeat,
+  type Solid,
+} from "../simulation/boarding";
 import { buildStreet } from "../simulation/street";
 import { buildBus } from "../simulation/bus";
 import { BusRouteController } from "../simulation/transit";
 import { castStreet } from "../simulation/residents";
+import {
+  createStoryNpcDirector,
+  type ActiveStoryNpcDialogue,
+  type AmbientStreetBark,
+  type StoryNpcRadarBlip,
+} from "../simulation/storyNpcs";
+import {
+  createHumanPresenceSystem,
+  type CrowdReactionBark,
+  type HumanPresenceSystem,
+} from "../simulation/humanPresence";
+import type { StoryNpcRuntimeContext } from "../../../../game/narrative/chapter1/storyCast";
+import { i18n } from "../../../../i18n";
 import { SaigonTrafficManager } from "../traffic";
 
 import {
@@ -39,6 +66,8 @@ export interface OpenWorldSnapshot {
   district: string;
   position: { x: number; y: number; z: number };
   headingDeg: number;
+  busPosition: { x: number; z: number };
+  npcBlips: readonly StoryNpcRadarBlip[];
   atmosphere: AtmosphereState;
   streaming: StreamingStats;
   doorOpen: boolean;
@@ -47,20 +76,16 @@ export interface OpenWorldSnapshot {
   busStatus: string;
   prompt: string | null;
   activeModal: "phone" | "note" | null;
+  storyDialogue: ActiveStoryNpcDialogue | null;
+  ambientBark: AmbientStreetBark | null;
+  crowdReaction: CrowdReactionBark | null;
   pointerLocked: boolean;
   fps: number;
   isIndoors: boolean;
 }
 
-const PHASE_LABELS: Record<string, string> = {
-  waiting: "Đang chờ xe vào trạm Lý Thái Tổ",
-  approaching: "Xe Buýt 06 đang cập bến Lý Thái Tổ",
-  boarding: "Đang mở cửa đón khách · Lý Thái Tổ",
-  departing: "Chuẩn bị khởi hành đi Chợ Lớn",
-  driving: "Đang chạy trên Lý Thái Tổ → Chợ Lớn",
-  arrived: "Đã đến Trạm Chợ Lớn · Quận 5",
-  complete: "Hoàn tất tuyến 06",
-};
+/** Bus 06 status line in the game language (`testbus.world.bus.<phase>`). */
+const phaseLabel = (phase: string) => tr(`bus.${phase}`);
 
 const LAPTOP_DRAFT =
   "Chào chị Linh,\nEm gửi chị bản báo cáo quý trước 10h sáng mai ạ. Phần chi phí em đã đối chiếu xong, còn phần tổng hợp em sẽ rà lần cuối đầu giờ sáng.\nCảm ơn chị nhiều.";
@@ -156,6 +181,8 @@ export interface ViewPose extends ViewLens {
    * can be seen through it is culled in, so the street hidden behind the room walls costs nothing. Omitted: full view.
    */
   portal?: { x0: number; y0: number; x1: number; y1: number } | null;
+  /** The room window is on screen (its glass shows this world's view). Omitted: guessed from `yaw`. */
+  windowInView?: boolean;
 }
 export interface PlayInput extends ViewLens {
   keys: ReadonlySet<string>;
@@ -222,6 +249,8 @@ export class OpenWorldEngine {
   public route: BusRouteController;
   public bus: ReturnType<typeof buildBus>;
   public cast: ReturnType<typeof castStreet>;
+  public storyNpcs: ReturnType<typeof createStoryNpcDirector>;
+  public humanPresence: HumanPresenceSystem = createHumanPresenceSystem();
   public districts: SaigonDistricts;
   public traffic: SaigonTrafficManager;
   public streamer: WorldStreamer;
@@ -258,7 +287,16 @@ export class OpenWorldEngine {
   private lightLevels = { ceiling: 0, desk: 1, bed: 1, kitchen: 0 };
   private lastScreenClock = "";
   public onBus = false;
-  private busLocalOffset = new T.Vector3(0.0, 0.72, 1.2);
+  /**
+   * On the bus the player stands or sits in bus-local coordinates (x right, z toward the rear; the front door is
+   * on the right at z -5.2..-3.7, the rear door at 0.3..1.8). They walk on through the open front door, sit with E,
+   * confirm the ride with F, and get off through the rear door once the bus has arrived.
+   */
+  private busLocal = { x: 1.0, z: -4.4 };
+  private busSeat: PassengerSeat | null = null;
+  /** Metres the player walked inside the bus this frame (not the bus's own motion). */
+  private busWalked = 0;
+  private readonly _busEye = new T.Vector3();
   private lastStreetEnvHash = -1;
   private renderFrame = 0;
   private lastCityRtYaw = 999;
@@ -284,6 +322,8 @@ export class OpenWorldEngine {
   private readonly _winNightCol = new T.Color(0x8d97c8);
   private readonly _outDayCol = new T.Color(0xfff0d4);
   private readonly _outNightCol = new T.Color(0x9fb8e8);
+  private readonly _convEyePos = new T.Vector3();
+  private convBlend = 0;
 
   // Input state
   private keys = new Set<string>();
@@ -850,10 +890,20 @@ export class OpenWorldEngine {
       () => {},
       this.street.solids,
       this.traffic,
+      this.humanPresence,
     );
 
     // 7. EXPANDED HO CHI MINH CITY DISTRICTS + EXACT BITEXCO TOWER & LANDMARK 81 + UNIFIED FLEET & NPCS
-    this.districts = buildSaigonDistricts(extScene, this.streamer, this.software, onAssetLoaded, this.traffic);
+    this.districts = buildSaigonDistricts(
+      extScene,
+      this.streamer,
+      this.software,
+      onAssetLoaded,
+      this.traffic,
+      this.humanPresence,
+    );
+    this.storyNpcs = createStoryNpcDirector(onAssetLoaded, this.humanPresence);
+    this.exteriorGroup.add(this.storyNpcs.group);
     this.outdoorLightSpecs = [...this.boardingHouse.lightSpecs, ...this.districts.lightSpecs];
 
     this.solidsGround = [
@@ -1105,7 +1155,13 @@ export class OpenWorldEngine {
     return 0.0;
   }
 
-  private resolveCollisions(nx: number, nz: number, y: number): { x: number; z: number } {
+  private resolveCollisions(
+    nx: number,
+    nz: number,
+    y: number,
+    playerSpeed = 0,
+    dt = 0.016,
+  ): { x: number; z: number } {
     const r = 0.26;
     let x = nx;
     let z = nz;
@@ -1175,6 +1231,26 @@ export class OpenWorldEngine {
         this.bumpVx = vehCol.impulseX;
         this.bumpVz = vehCol.impulseZ;
       }
+
+      // Solid physical human collision + shoulder-bump recoil against ALL Street Residents, Story NPCs & District Pedestrians!
+      const humCol = this.humanPresence.resolvePlayerCollision(
+        x,
+        z,
+        y,
+        r,
+        playerSpeed,
+        this.elapsed,
+        dt,
+      );
+      x = humCol.x;
+      z = humCol.z;
+      if (humCol.bumped) {
+        this.bumpVx = humCol.impulseX;
+        this.bumpVz = humCol.impulseZ;
+        if (this.audio.started && !this.external) {
+          this.audio.footstep(Math.min(1.4, 0.75 + humCol.impactStrength * 0.4));
+        }
+      }
     }
 
     if (!this.districts.isWithinOpenWorld(x, z)) {
@@ -1207,22 +1283,34 @@ export class OpenWorldEngine {
       return;
     }
 
-    if (this.onBus) {
-      this.onBus = false;
-      this.feet.set(this.route.x + 2.7, CURB_HEIGHT, this.route.z - 4.0);
-      if (this.audio.started) this.audio.footstep(1);
+    if (this.storyNpcs.getActiveDialogue()) {
+      this.storyNpcs.advanceDialogue();
       return;
     }
 
+    if (this.onBus) {
+      // E sits on the nearest seat, or stands up again (the doors decide whether the player can get off).
+      if (this.busSeat) {
+        this.busLocal = { x: Math.sign(this.busSeat.x) * 0.2, z: this.busSeat.aisleZ };
+        this.busSeat = null;
+        return;
+      }
+      const seat = this.nearestBusSeat();
+      if (seat) this.busSeat = seat;
+      return;
+    }
+
+    if (this.feet.y < 1.2) {
+      const targetNpc = this.storyNpcs.nearestInteractable(this.feet);
+      if (targetNpc) {
+        this.storyNpcs.beginDialogue(targetNpc.npc.id);
+        return;
+      }
+    }
     const doorPos = this.busDoorWorldPos();
     if (Math.hypot(this.feet.x - doorPos.x, this.feet.z - doorPos.z) < 4.8 && this.feet.y < 1.2) {
-      this.onBus = true;
+      // The bus is not at the stop yet: wait for it (time skips to its arrival). At the stop the player walks on.
       if (this.route.phase === "waiting") this.route.wait();
-      if (this.route.phase === "boarding") {
-        this.route.pay(true);
-        this.route.depart(true, false);
-      }
-      if (this.audio.started) this.audio.footstep(1);
       return;
     }
 
@@ -1276,13 +1364,43 @@ export class OpenWorldEngine {
     this.hoveredId = null;
 
     if (this.onBus) {
-      this.currentPrompt = `[E] Xuống xe Buýt Tuyến 06 · ${PHASE_LABELS[this.route.phase] ?? this.route.phase}`;
+      const phase = this.route.phase;
+      const status = phaseLabel(phase);
+      const atEnd = phase === "arrived" || phase === "complete";
+      if (this.busSeat) {
+        this.currentPrompt =
+          phase === "boarding"
+            ? tr("prompt.confirmRide")
+            : atEnd
+              ? tr("prompt.standUpRear")
+              : tr("prompt.noMidway", { status });
+      } else {
+        this.currentPrompt = this.nearestBusSeat() ? tr("prompt.sitDown", { status }) : atEnd ? tr("prompt.offRear") : status;
+      }
       return;
+    }
+    if (this.feet.y < 1.2 && !this.storyNpcs.getActiveDialogue()) {
+      const targetNpc = this.storyNpcs.nearestInteractable(this.feet);
+      if (targetNpc) {
+        const lang = i18n.language === "en" ? "en" : "vi";
+        const name = lang === "vi" ? targetNpc.npc.name.vi : targetNpc.npc.name.en;
+        const role = lang === "vi" ? targetNpc.npc.role.vi : targetNpc.npc.role.en;
+        this.currentPrompt =
+          lang === "vi"
+            ? `[E] Nói chuyện với ${name} (${role})`
+            : `[E] Talk to ${name} (${role})`;
+        return;
+      }
     }
 
     const busDoor = this.busDoorWorldPos();
     if (this.feet.y < 1.2 && Math.hypot(this.feet.x - busDoor.x, this.feet.z - busDoor.z) < 4.8) {
-      this.currentPrompt = "[E] Lên Xe Buýt Tuyến 06 (Lý Thái Tổ ↔ Chợ Lớn)";
+      this.currentPrompt =
+        this.route.phase === "boarding"
+          ? tr("prompt.walkOn")
+          : this.route.phase === "waiting"
+            ? tr("prompt.waitBus")
+            : phaseLabel(this.route.phase);
       return;
     }
 
@@ -1295,8 +1413,8 @@ export class OpenWorldEngine {
       this.currentPrompt = this.external
         ? null
         : this.doorOpen
-          ? "[E] Đóng cửa Phòng 6.07"
-          : "[E] Mở cửa ra hành lang Dãy Trọ 462/14";
+          ? tr("prompt.closeRoomDoor")
+          : tr("prompt.openToHall");
       return;
     }
 
@@ -1309,15 +1427,15 @@ export class OpenWorldEngine {
         if (id) {
           this.hoveredId = id;
           const labels: Record<string, string> = {
-            desklamp: "[E] Bật / Tắt đèn bàn",
-            switch: "[E] Công tắc đèn trần",
-            bedlamp: "[E] Đèn ngủ đầu giường",
-            kitchenlight: "[E] Đèn bếp",
-            phone: "[E] Xem điện thoại",
-            note: "[E] Đọc tờ ghi chú",
-            window: this.winOpen ? "[E] Đóng cửa sổ" : "[E] Kéo mở cửa sổ ngắm Sài Gòn",
-            fridge: this.fridgeOpen ? "[E] Đóng tủ lạnh" : "[E] Mở tủ lạnh",
-            door: this.doorOpen ? "[E] Đóng cửa Phòng 6.07" : "[E] Mở cửa ra Dãy Trọ",
+            desklamp: tr("prompt.deskLamp"),
+            switch: tr("prompt.ceilingLight"),
+            bedlamp: tr("prompt.bedLamp"),
+            kitchenlight: tr("prompt.kitchenLight"),
+            phone: tr("prompt.phone"),
+            note: tr("prompt.note"),
+            window: this.winOpen ? tr("prompt.closeWindow") : tr("prompt.openWindow"),
+            fridge: this.fridgeOpen ? tr("prompt.closeFridge") : tr("prompt.openFridge"),
+            door: this.doorOpen ? tr("prompt.closeRoomDoor") : tr("prompt.openToBuilding"),
           };
           this.currentPrompt = labels[id] ?? null;
           return;
@@ -1382,10 +1500,105 @@ export class OpenWorldEngine {
     if (this.audio.started) this.audio.doorClose();
   }
 
+  /** Bus-local walking speed (m/s). */
+  private static readonly BUS_WALK = 1.5;
+  /** Floor height inside the bus (steps at the doors). */
+  private busFloor(L: { x: number; z: number }): number {
+    return busFloorAt(busToWorld(L, this.route), L);
+  }
+  /** Nearest seat within reach of where the player stands in the bus, or null. */
+  private nearestBusSeat(): PassengerSeat | null {
+    if (this.busSeat) return null;
+    let best: PassengerSeat | null = null;
+    let bestD = 1.25;
+    for (const seat of BUS_SEATS) {
+      const d = Math.hypot(seat.x - this.busLocal.x, seat.z - this.busLocal.z);
+      if (d < bestD) {
+        bestD = d;
+        best = seat;
+      }
+    }
+    return best;
+  }
+  /** World x/z of a move by `forward` / `strafe` this frame at `speed`. */
+  private walkDelta(forward: number, strafe: number, speed: number, dt: number) {
+    const sinY = Math.sin(this.yaw);
+    const cosY = Math.cos(this.yaw);
+    const dx = -sinY * forward + cosY * strafe;
+    const dz = -cosY * forward - sinY * strafe;
+    const len = Math.hypot(dx, dz) || 1;
+    return { dx: (dx / len) * speed * dt, dz: (dz / len) * speed * dt };
+  }
+  /** The bus is at the stop with the front door open and the player walks into the doorway: they are on board. */
+  private tryWalkOnBus(forward: number, strafe: number, dt: number) {
+    if (this.route.phase !== "boarding" || !this.route.doors.front.passable || this.feet.y > 1.2) return;
+    const { dx, dz } = this.walkDelta(forward, strafe, 4.2, dt);
+    const local = busToLocal({ x: this.feet.x + dx, z: this.feet.z + dz }, this.route);
+    const door = BUS_DOORS.front;
+    if (local.x > 1.85 || local.x < 0.9 || local.z < door.min + 0.2 || local.z > door.max - 0.2) return;
+    this.onBus = true;
+    this.busSeat = null;
+    this.busLocal = { x: Math.min(local.x, 1.45), z: local.z };
+    this.route.passengerCrossed(true);
+    this.carryOnBus();
+  }
+  /** Walking inside the bus (bus-local, against its walls and closed doors); off through an open door. */
+  private stepOnBus(dt: number, forward: number, strafe: number) {
+    if (this.busSeat || this.activeModal || (forward === 0 && strafe === 0)) {
+      this.carryOnBus();
+      return;
+    }
+    const sprint = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight");
+    const { dx, dz } = this.walkDelta(forward, strafe, OpenWorldEngine.BUS_WALK * (sprint ? 1.4 : 1), dt);
+    // World delta into bus-local axes (the inverse of the bus yaw).
+    const c = Math.cos(this.route.yaw);
+    const s = Math.sin(this.route.yaw);
+    const lx = c * dx - s * dz;
+    const lz = s * dx + c * dz;
+    const steps = Math.max(1, Math.ceil(Math.hypot(lx, lz) / 0.06));
+    const L = this.busLocal;
+    const x0 = L.x;
+    const z0 = L.z;
+    for (let i = 0; i < steps; i++) {
+      for (const [ax, az] of [[lx / steps, 0], [0, lz / steps]]) {
+        const next = { x: L.x + ax, z: L.z + az };
+        if (!blocksBus(next, this.route)) {
+          L.x = next.x;
+          L.z = next.z;
+        }
+      }
+    }
+    this.busWalked = Math.hypot(L.x - x0, L.z - z0);
+    this.bob += this.busWalked * 2.8;
+    // Out through an open door onto the curb. The doors are shut while the bus runs, so nobody leaves mid-route.
+    if (!insideBus(L) && L.x > 1.62) {
+      const world = busToWorld(L, this.route);
+      this.onBus = false;
+      this.busSeat = null;
+      this.feet.set(world.x + 0.25, CURB_HEIGHT, world.z);
+      this.route.passengerCrossed(false, this.route.phase === "arrived");
+      return;
+    }
+    this.carryOnBus();
+  }
+  /** Keeps the player's feet with the bus (world position of the bus-local spot). */
+  private carryOnBus() {
+    const L = this.busSeat ?? this.busLocal;
+    const w = busToWorld(L, this.route);
+    this.feet.set(w.x, this.busFloor(L), w.z);
+  }
+  /** Embedded F on the bus: seated at the stop, the player confirms and the bus leaves (fare paid, doors close). */
+  public confirmRide() {
+    if (!this.onBus || !this.busSeat || this.route.phase !== "boarding") return;
+    if (this.route.pay(true)) this.route.depart(true, false);
+  }
   private syncCamera() {
     if (this.onBus) {
-      const p = this.bus.root.localToWorld(this.busLocalOffset.clone());
-      this.camera.position.set(p.x, p.y + 1.0, p.z);
+      // The bus matrix is refreshed first: a stale one put the eye a frame behind the bus and the view shook.
+      this.bus.root.updateMatrixWorld(true);
+      const L = this.busSeat ? this.busSeat : this.busLocal;
+      const eye = this.busSeat ? seatBase(this.busSeat.z) + 1.18 : this.busFloor(L) + 1.6;
+      this.camera.position.copy(this.bus.root.localToWorld(this._busEye.set(L.x, eye, L.z)));
     } else {
       const breathe = Math.sin(this.elapsed * 1.1) * 0.004;
       const bobY = Math.sin(this.bob * 2) * 0.028;
@@ -1587,6 +1800,7 @@ export class OpenWorldEngine {
     else cam.rotation.set(pose.pitch, pose.yaw, 0);
     this.wantBackdrop = pose.backdrop;
     this.backdropPortal = pose.portal ?? null;
+    this.extWindowInView = pose.windowInView ?? Math.cos(pose.yaw) > -0.2;
     this.frame(dt);
   }
 
@@ -1602,6 +1816,12 @@ export class OpenWorldEngine {
     this.wasIndoors = false;
     this.outdoorWarmupFrames = 6;
     this.lastShadowX = 9999;
+    // The street's horns, revs and bed (the page has had a user gesture by now: the player walked out).
+    this.traffic.audio.unlock();
+  }
+  /** Embedded: the game's sound setting for the street audio. */
+  public setStreetMuted(muted: boolean) {
+    this.traffic.audio.setMuted(muted);
   }
 
   /** Embedded, player outside: move with the room's input and draw the backdrop. */
@@ -1625,7 +1845,7 @@ export class OpenWorldEngine {
     this.wantBackdrop = true;
     this.backdropPortal = null;
     this.frame(dt);
-    out.moved = Math.hypot(this.feet.x - fx, this.feet.z - fz);
+    out.moved = this.onBus ? this.busWalked : Math.hypot(this.feet.x - fx, this.feet.z - fz);
     out.inRoom = !this.onBus && this.isInsideRoom(this.feet.x, this.feet.y, this.feet.z);
     out.position.copy(this.camera.position).sub(ROOM_ANCHOR);
     return out;
@@ -1645,11 +1865,13 @@ export class OpenWorldEngine {
   }
 
   /** Embedded: what `stepView` / `stepPlay` drew this frame (null when nothing was drawn). */
-  public get backdrop(): { color: T.Texture; depth: T.DepthTexture } | null {
+  public get backdrop(): { color: T.Texture; depth: T.DepthTexture; scale: T.Vector2 } | null {
     const rt = this.backdropRT;
     if (!rt || !rt.depthTexture || !this.backdropDrawn) return null;
-    return { color: rt.texture, depth: rt.depthTexture };
+    return { color: rt.texture, depth: rt.depthTexture, scale: this.backdropScale };
   }
+  /** Part of the backdrop target that holds the picture (uv scale). */
+  private readonly backdropScale = new T.Vector2(1, 1);
   private backdropDrawn = false;
 
   /** The location line and the street state for the host HUD while playing embedded. */
@@ -1659,6 +1881,8 @@ export class OpenWorldEngine {
   private lastSnap: OpenWorldSnapshot | null = null;
   private lastAssetAt = 0;
   private viewShadowT = 0;
+  /** ViewPose.windowInView of the last stepView. */
+  private extWindowInView = true;
   private shadowProgramsDirty = true;
 
   private frame(dt: number) {
@@ -1671,8 +1895,13 @@ export class OpenWorldEngine {
       (this.keys.has("KeyD") || this.keys.has("ArrowRight") ? 1 : 0) -
       (this.keys.has("KeyA") || this.keys.has("ArrowLeft") ? 1 : 0);
 
+    this.busWalked = 0;
+    // Walking into the open front door at the stop steps straight up onto the bus.
+    if (!viewMode && !this.onBus && !this.activeModal && (forward !== 0 || strafe !== 0)) this.tryWalkOnBus(forward, strafe, dt);
     if (viewMode) {
       // window view only: the player stays in the room
+    } else if (this.onBus) {
+      this.stepOnBus(dt, forward, strafe);
     } else if (!this.onBus && !this.activeModal && (forward !== 0 || strafe !== 0)) {
       const sprinting = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight");
       const indoorsNow = this.isInsideRoom(this.feet.x, this.feet.y, this.feet.z);
@@ -1686,7 +1915,13 @@ export class OpenWorldEngine {
       dx = (dx / len) * speed * dt;
       dz = (dz / len) * speed * dt;
 
-      const resolved = this.resolveCollisions(this.feet.x + dx, this.feet.z + dz, this.feet.y);
+      const resolved = this.resolveCollisions(
+        this.feet.x + dx,
+        this.feet.z + dz,
+        this.feet.y,
+        speed,
+        dt,
+      );
       const moved = Math.hypot(resolved.x - this.feet.x, resolved.z - this.feet.z);
       this.feet.x = resolved.x;
       this.feet.z = resolved.z;
@@ -1699,7 +1934,8 @@ export class OpenWorldEngine {
         this.stepDist += moved;
         if (this.stepDist > 0.65) {
           this.stepDist = 0;
-          if (this.audio.started) this.audio.footstep(indoorsNow ? 0.85 : 1.0);
+          // Embedded, the room plays the player's footsteps (dry / wet walking, as in the neighborhood).
+          if (this.audio.started && !this.external) this.audio.footstep(indoorsNow ? 0.85 : 1.0);
         }
       }
     } else if (!this.onBus) {
@@ -1709,6 +1945,8 @@ export class OpenWorldEngine {
           this.feet.x + this.bumpVx * dt,
           this.feet.z + this.bumpVz * dt,
           this.feet.y,
+          Math.hypot(this.bumpVx, this.bumpVz),
+          dt,
         );
         this.feet.x = pushed.x;
         this.feet.z = pushed.z;
@@ -1724,6 +1962,20 @@ export class OpenWorldEngine {
             this.bumpVx = standHit.impulseX;
             this.bumpVz = standHit.impulseZ;
           }
+        }
+        // Even while standing still, moving walkers push cleanly past Alex & lingering triggers personal-space awareness!
+        const humStand = this.humanPresence.resolvePlayerCollision(
+          this.feet.x,
+          this.feet.z,
+          this.feet.y,
+          0.26,
+          0,
+          this.elapsed,
+          dt,
+        );
+        if (humStand.hitHuman) {
+          this.feet.x = humStand.x;
+          this.feet.z = humStand.z;
         }
       }
       const targetY = this.getFloorHeight(this.feet.x, this.feet.z, this.feet.y);
@@ -1747,6 +1999,8 @@ export class OpenWorldEngine {
 
     // 3. Atmosphere, 24h Day/Night Sky, Tropical Rain & Wet-Surface Reflections
     const indoors = this.isInsideRoom(this.feet.x, this.feet.y, this.feet.z);
+    // Street bed and street horns only out on the street (the room has its own muffled city).
+    this.traffic.audio.setAmbience(viewMode || indoors ? 0 : 1);
     // Stagger outdoor GPU wakeup over 4 frames on room exit (street -> bus+districts -> cast -> shadow -> reflector)
     // Guarantees ZERO frame-spike stacking when stepping out of Room 6.07 onto the balcony!
     if (indoors) {
@@ -1883,13 +2137,74 @@ export class OpenWorldEngine {
         this.feet.x,
         this.feet.z,
       );
+      // Off at the rear door only: on arrival the front door stays shut.
+      if ((this.route.phase === "arrived" || this.route.phase === "complete") && this.route.doors.front.target === 1) {
+        this.route.doors.front.target = 0;
+      }
       this.bus.update(dt);
+      // The bus moved after the camera was placed: place it again so the view rides with the bus.
+      if (this.onBus && !viewMode) {
+        this.carryOnBus();
+        this.syncCamera();
+      }
     }
 
     const showBusCast = !indoors && this.outdoorWarmupFrames >= 3 && distToBusHub < 105;
     this.busCastGroup.visible = showBusCast;
     if (showBusCast) {
-      this.cast.update(dt, this.elapsed, this.camera.position);
+      this.cast.update(dt, this.elapsed, this.camera.position, atm.rainIntensity);
+    }
+    this.storyNpcs.group.visible = !indoors && this.outdoorWarmupFrames >= 3;
+    if (this.storyNpcs.group.visible) {
+      this.storyNpcs.update(dt, this.elapsed, this.camera.position, atm.rainIntensity);
+    }
+
+    // Smooth GTA-6 / Cyberpunk cinematic conversation camera framing (works in BOTH /testbus AND Room Chapter 1!).
+    // Frames the speaker's head, eyes, and gesturing hands cleanly so their face is NEVER cut off.
+    if (!viewMode) {
+      const inConversation = this.storyNpcs.getConversationEyePos(this._convEyePos);
+      this.convBlend = T.MathUtils.damp(this.convBlend, inConversation ? 1 : 0, 5.8, dt);
+
+      if (this.convBlend > 0.005 || (!this.external && Math.abs(this.camera.fov - 64) > 0.05)) {
+        const baseFov = this.external ? this.camera.fov : 64;
+        const targetFov = inConversation ? 50 : baseFov;
+        if (this.external) {
+          if (this.convBlend > 0.005) {
+            this.camera.fov = T.MathUtils.lerp(baseFov, 50, this.convBlend);
+            this.camera.updateProjectionMatrix();
+          }
+        } else if (Math.abs(this.camera.fov - targetFov) > 0.05) {
+          this.camera.fov = T.MathUtils.damp(this.camera.fov, targetFov, 6.2, dt);
+          this.camera.updateProjectionMatrix();
+        }
+      }
+
+      if (inConversation && !this.dragging) {
+        const dx = this._convEyePos.x - this.camera.position.x;
+        // Aim slightly below crown of head (~eye/chin line) so full head + shoulders sit cleanly in upper third!
+        const dy = this._convEyePos.y - 0.14 - this.camera.position.y;
+        const dz = this._convEyePos.z - this.camera.position.z;
+        const horiz = Math.hypot(dx, dz);
+        if (horiz > 0.3) {
+          const desiredYaw = Math.atan2(-dx, -dz);
+          let dyaw = desiredYaw - this.yaw;
+          while (dyaw > Math.PI) dyaw -= Math.PI * 2;
+          while (dyaw < -Math.PI) dyaw += Math.PI * 2;
+          const desiredPitch = T.MathUtils.clamp(Math.atan2(dy, horiz), -0.35, 0.38);
+
+          if (this.external) {
+            // Blend embedded Room Chapter 1 camera smoothly toward the speaker's face every frame!
+            const blend = this.convBlend * 0.88;
+            this.yaw += dyaw * blend;
+            this.pitch = T.MathUtils.lerp(this.pitch, desiredPitch, blend);
+            this.syncCamera();
+          } else {
+            this.yaw += dyaw * Math.min(1, dt * 4.8);
+            this.pitch = T.MathUtils.damp(this.pitch, desiredPitch, 4.8, dt);
+            this.syncCamera();
+          }
+        }
+      }
     }
 
     // 8. Hover Interaction Prompt (throttled to 15 Hz so CPU raycast never spikes camera turns!)
@@ -1908,12 +2223,16 @@ export class OpenWorldEngine {
     // hardware POT 512×256 RGBA8 cityRT (< 0.2ms!). Skipped completely when looking away from the north window!
     if (indoors) {
       // Camera forward Z = -cos(yaw); north window is at -Z, so cos(yaw) > -0.20 means window may be in view.
-      const facingNorthWindow = Math.cos(this.yaw) > -0.2;
+      // Embedded, the room says whether its window is on screen (inspect poses do not follow yaw / pitch).
+      const facingNorthWindow = this.external && viewMode ? this.extWindowInView : Math.cos(this.yaw) > -0.2;
       const camMoved =
         Math.abs(this.yaw - this.lastCityRtYaw) > 0.002 ||
         Math.abs(this.pitch - this.lastCityRtPitch) > 0.002;
       const sinceCityRt = this.elapsed - this.lastCityRtTime;
-      if (facingNorthWindow && (camMoved || sinceCityRt >= 0.15)) {
+      // While the view turns, or while it rains (the falling rain outside is in this picture: at the 0.15 s idle
+      // refresh it stepped down the glass in slow jerks), the glass view follows at up to ~30 Hz.
+      const live = camMoved || atm.rainIntensity > 0.02;
+      if (facingNorthWindow && ((live && sinceCityRt >= 1 / 32) || sinceCityRt >= 0.15)) {
         this.lastCityRtYaw = this.yaw;
         this.lastCityRtPitch = this.pitch;
         this.lastCityRtTime = this.elapsed;
@@ -1931,7 +2250,7 @@ export class OpenWorldEngine {
           // The window view refreshes the outdoor shadow maps every few seconds (the sun moves slowly).
           this.viewShadowT -= sinceCityRt;
           sm.needsUpdate = this.viewShadowT <= 0;
-          if (this.viewShadowT <= 0) this.viewShadowT = 4;
+          if (this.viewShadowT <= 0) this.viewShadowT = 12;
         }
         this.renderer.setRenderTarget(this.cityRT);
         this.renderer.render(this.scene, this.camera);
@@ -2055,7 +2374,7 @@ export class OpenWorldEngine {
         // The sun moves slowly: refresh this world's shadow maps every few seconds while it is seen.
         this.backdropShadowT -= dt;
         if (this.backdropShadowT <= 0) {
-          this.backdropShadowT = 4;
+          this.backdropShadowT = 12;
           sm.needsUpdate = true;
         }
         const size = r.getDrawingBufferSize(this._bdSize);
@@ -2063,29 +2382,31 @@ export class OpenWorldEngine {
         const prev = r.getRenderTarget();
         const rt = this.backdropRT;
         const W = rt.width, H = rt.height;
+        // The street is drawn at a reduced resolution in the lower-left part of the target (no reallocation when the
+        // scale changes): through the door from inside the room it is a small, soft part of the view; outside it
+        // fills the screen. The room samples it with `backdrop.scale`.
+        const sc = Math.min(viewMode ? 0.62 : 0.8, 1000 / Math.max(1, H));
+        const Wf = Math.max(1, Math.floor(W * sc)), Hf = Math.max(1, Math.floor(H * sc));
+        this.backdropScale.set((Wf - 0.5) / W, (Hf - 0.5) / H);
         rt.viewport.set(0, 0, W, H);
         rt.scissorTest = false;
         r.setRenderTarget(rt);
         r.clear(true, true, false);
         const pp = this.backdropPortal;
-        if (pp) {
-          // Draw only the door / window part of the screen, with a camera frustum cut to it (so the city hidden
-          // behind the room walls is culled). The depth values match the full view: an off-centre projection keeps z.
-          const x = Math.max(0, Math.floor(pp.x0 * W)), y = Math.max(0, Math.floor(pp.y0 * H));
-          const w = Math.min(W, Math.ceil(pp.x1 * W)) - x, h = Math.min(H, Math.ceil(pp.y1 * H)) - y;
-          if (w > 0 && h > 0) {
-            rt.viewport.set(x, y, w, h);
-            rt.scissor.set(x, y, w, h);
-            rt.scissorTest = true;
-            this.camera.setViewOffset(W, H, x, H - y - h, w, h);
-            r.setRenderTarget(rt);
-            r.render(this.scene, this.camera);
-            this.camera.clearViewOffset();
-            rt.viewport.set(0, 0, W, H);
-            rt.scissorTest = false;
-          }
-        } else {
+        // Only the door / window part of the screen (all of it outside), with a camera frustum cut to it, so the city
+        // hidden behind the room walls is culled. The depth values match the full view: an off-centre projection keeps z.
+        const x = pp ? Math.max(0, Math.floor(pp.x0 * Wf)) : 0, y = pp ? Math.max(0, Math.floor(pp.y0 * Hf)) : 0;
+        const w = (pp ? Math.min(Wf, Math.ceil(pp.x1 * Wf)) : Wf) - x, h = (pp ? Math.min(Hf, Math.ceil(pp.y1 * Hf)) : Hf) - y;
+        if (w > 0 && h > 0) {
+          rt.viewport.set(x, y, w, h);
+          rt.scissor.set(x, y, w, h);
+          rt.scissorTest = true;
+          this.camera.setViewOffset(Wf, Hf, x, Hf - y - h, w, h);
+          r.setRenderTarget(rt);
           r.render(this.scene, this.camera);
+          this.camera.clearViewOffset();
+          rt.viewport.set(0, 0, W, H);
+          rt.scissorTest = false;
         }
         r.setRenderTarget(prev);
         this.backdropDrawn = true;
@@ -2128,14 +2449,22 @@ export class OpenWorldEngine {
           z: Number(this.feet.z.toFixed(1)),
         },
         headingDeg: Math.round(deg),
+        busPosition: {
+          x: Number(this.bus.root.position.x.toFixed(1)),
+          z: Number(this.bus.root.position.z.toFixed(1)),
+        },
+        npcBlips: this.storyNpcs.getRadarBlips(),
         atmosphere: { ...atm },
         streaming: streamStats,
         doorOpen: this.doorOpen,
         gateOpen: this.gateOpen,
         onBus: this.onBus,
-        busStatus: PHASE_LABELS[this.route.phase] ?? this.route.phase,
+        busStatus: phaseLabel(this.route.phase),
         prompt: this.currentPrompt,
         activeModal: this.activeModal,
+        storyDialogue: this.storyNpcs.getActiveDialogue(),
+        ambientBark: this.storyNpcs.getAmbientBark(),
+        crowdReaction: this.humanPresence.getActiveReaction(this.elapsed),
         pointerLocked: this.pointerLocked,
         fps: this.fps,
         isIndoors: indoors,
@@ -2153,7 +2482,25 @@ export class OpenWorldEngine {
       this.keys.add(e.code);
       this.ensureAudio();
       if (e.code === "KeyE") this.tryInteract();
-      if (e.code === "Escape" && this.activeModal) this.activeModal = null;
+      if (e.code === "KeyF" && !e.repeat) this.confirmRide();
+      if (e.code === "Escape") {
+        if (this.activeModal) this.activeModal = null;
+        if (this.storyNpcs.getActiveDialogue()) this.storyNpcs.closeDialogue();
+      }
+      if (this.storyNpcs.getActiveDialogue() && !e.repeat) {
+        if (e.code === "Digit1") {
+          this.storyNpcs.selectReply(0);
+          return;
+        }
+        if (e.code === "Digit2") {
+          this.storyNpcs.selectReply(1);
+          return;
+        }
+        if (e.code === "Digit3") {
+          this.storyNpcs.selectReply(2);
+          return;
+        }
+      }
       if (!this.external) {
         if (e.code === "Digit1") this.setWeather("clear");
         if (e.code === "Digit2") this.setWeather("overcast");
@@ -2275,6 +2622,22 @@ export class OpenWorldEngine {
     };
   }
 
+  public setStoryContext(ctx: Partial<StoryNpcRuntimeContext>) {
+    this.storyNpcs.setContext(ctx);
+  }
+
+  public selectStoryReply(index: number) {
+    this.storyNpcs.selectReply(index);
+  }
+
+  public advanceStoryDialogue() {
+    this.storyNpcs.advanceDialogue();
+  }
+
+  public closeStoryDialogue() {
+    this.storyNpcs.closeDialogue();
+  }
+
   public dispose() {
     this.disposed = true;
     this.unsubPbrWarmup?.();
@@ -2287,6 +2650,8 @@ export class OpenWorldEngine {
     this.boardingHouse.dispose();
     this.street.dispose();
     this.cast.dispose();
+    this.storyNpcs.dispose();
+    this.humanPresence.clear();
     if (!this.external) this.cityRT.dispose();
     this.warmupRT.dispose();
     this.warmupViewRT?.dispose();
