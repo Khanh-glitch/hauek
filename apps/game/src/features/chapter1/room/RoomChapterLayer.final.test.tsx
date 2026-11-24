@@ -95,10 +95,14 @@ function reviseThesisDocument(laptop: HTMLElement) {
   const editor = within(laptop).getByTestId("thesis-document-editor") as HTMLTextAreaElement;
   fireEvent.change(editor, {
     target: {
-      value: `${editor.value} This revision clarifies the link between administrative uncertainty and the decisions described in the interviews.`,
+      value: editor.value.replace(
+        "Less attention has been paid to how uncertainty about university procedures shapes the way students respond.",
+        "Less attention has been paid to how uncertainty about university procedures shapes the way students respond. This revision clarifies the link between administrative uncertainty and the decisions described in the interviews.",
+      ),
     },
   });
   fireEvent.click(within(laptop).getByTestId("thesis-save"));
+  fireEvent.click(within(laptop).getByTestId("thesis-resolve-comment"));
 }
 
 beforeEach(() => {
@@ -201,8 +205,11 @@ describe("the safe path: Mail, UEH Portal bookmark, Training Office, Evidence, T
     fireEvent.click(within(laptop).getByTestId("device-action-mail.clearance-save-record"));
     expect(rig.store().getState().device.items["file.email-record"]).toBeDefined();
 
-    // The link is not followed. The saved bookmark is used instead.
+    // The link is not followed. The saved bookmark is used instead. The published fee page gives
+    // Alex a natural way to compare the payment address before checking the account.
     laptop = await goToBookmark(rig, PORTAL);
+    fireEvent.click(within(laptop).getByTestId("portal-nav-services"));
+    expect((await within(laptop).findByTestId("portal-payment-domain")).textContent).toBe("payment.ueh.edu.vn");
     fireEvent.click(within(laptop).getByTestId("portal-nav-account"));
     await within(laptop).findByTestId("portal-check-account");
     expect(rig.store().getState().device.items["portal.saved"].done).not.toContain("check-account");
@@ -234,6 +241,44 @@ describe("the safe path: Mail, UEH Portal bookmark, Training Office, Evidence, T
     expect(after.persistent.loginCredentialsExposed).toBeFalsy();
     expect(after.persistent.accountCompromised).toBeFalsy();
   });
+});
+
+describe("the final submission", () => {
+  it("requires the saved draft and verified access, submits from the portal, and displays the receipt", async () => {
+    const rig = mountLayer();
+    let laptop = app(rig, "thesis");
+    reviseThesisDocument(laptop);
+
+    fireEvent.click(within(laptop).getByRole("button", { name: /Findings/ }));
+    let editor = within(laptop).getByTestId("thesis-document-editor") as HTMLTextAreaElement;
+    fireEvent.click(within(laptop).getByTestId("thesis-synthesis-choice-saved-channel"));
+    fireEvent.click(within(laptop).getByTestId("thesis-insert-synthesis"));
+    fireEvent.change(editor, { target: { value: editor.value.replace("Across the interviews, students described", "Interview participants described") } });
+    fireEvent.click(within(laptop).getByTestId("thesis-resolve-comment"));
+
+    fireEvent.click(within(laptop).getByRole("button", { name: /Full draft/ }));
+    editor = within(laptop).getByTestId("thesis-document-editor") as HTMLTextAreaElement;
+    fireEvent.change(editor, { target: { value: editor.value.replace("The interviews suggest", "These interviews suggest") } });
+    fireEvent.click(within(laptop).getByTestId("thesis-resolve-comment"));
+    expect(rig.store().getState().world.thesisTasksDone).toEqual(expect.arrayContaining(["draft.intro-review", "draft.findings", "draft.final"]));
+    expect(rig.store().getState().device.submission).toBe("not-submitted");
+
+    laptop = await goToBookmark(rig, PORTAL);
+    fireEvent.click(within(laptop).getByTestId("portal-nav-thesis"));
+    const blockedSubmit = await within(laptop).findByTestId("portal-submit-thesis");
+    expect((blockedSubmit as HTMLButtonElement).disabled).toBe(true);
+    expect(within(laptop).getByTestId("portal-submit-blocked-hint").textContent).toContain("confirm access");
+
+    fireEvent.click(within(laptop).getByTestId("portal-nav-account"));
+    fireEvent.click(await within(laptop).findByTestId("portal-check-account"));
+    fireEvent.click(within(laptop).getByTestId("portal-nav-thesis"));
+    const submit = await within(laptop).findByTestId("portal-submit-thesis");
+    expect((submit as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(submit);
+    expect(await within(laptop).findByTestId("portal-submission-receipt")).toBeTruthy();
+    expect(rig.store().getState().device.submission).toBe("submitted");
+    expect(rig.store().getState().world.missions["m01.final-submission"].status).toBe("completed");
+  }, 30_000);
 });
 
 describe("the skip path: no email, the thesis goes on, the access stays unverified", () => {
