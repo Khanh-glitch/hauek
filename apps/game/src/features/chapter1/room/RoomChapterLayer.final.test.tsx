@@ -91,6 +91,16 @@ async function goToBookmark(rig: Rig, url: string) {
   return laptop;
 }
 
+function reviseThesisDocument(laptop: HTMLElement) {
+  const editor = within(laptop).getByTestId("thesis-document-editor") as HTMLTextAreaElement;
+  fireEvent.change(editor, {
+    target: {
+      value: `${editor.value} This revision clarifies the link between administrative uncertainty and the decisions described in the interviews.`,
+    },
+  });
+  fireEvent.click(within(laptop).getByTestId("thesis-save"));
+}
+
 beforeEach(() => {
   act(() => {
     applyLocale("en");
@@ -210,7 +220,11 @@ describe("the safe path: Mail, UEH Portal bookmark, Training Office, Evidence, T
     const before = rig.store().getState().resources.thesisProgress;
     laptop = app(rig, "thesis");
     expect(within(laptop).getByTestId("thesis-window")).toBeTruthy();
-    fireEvent.click(within(laptop).getByTestId("thesis-work"));
+    reviseThesisDocument(laptop);
+    // Leaving the document to answer an email must not discard Alex's draft.
+    app(rig, "device-mail");
+    laptop = app(rig, "thesis");
+    expect((within(laptop).getByTestId("thesis-document-editor") as HTMLTextAreaElement).value).toContain("This revision clarifies the link");
     const after = rig.store().getState();
     expect(after.resources.thesisProgress).toBeGreaterThan(before);
 
@@ -227,7 +241,7 @@ describe("the skip path: no email, the thesis goes on, the access stays unverifi
     const rig = mountLayer();
     play(rig, [advance(10)]);
     const laptop = app(rig, "thesis");
-    fireEvent.click(within(laptop).getByTestId("thesis-work"));
+    reviseThesisDocument(laptop);
     const state = rig.store().getState();
     expect(state.resources.thesisProgress).toBeGreaterThan(60);
     expect(state.resources.cash).toBe(START_CASH);

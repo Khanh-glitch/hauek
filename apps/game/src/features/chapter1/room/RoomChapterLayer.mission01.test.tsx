@@ -149,18 +149,18 @@ describe("Mission 01 in the phone", () => {
     expect(screen.getByTestId("task-current").textContent).toBe("Read the new email about your submission account");
   }, 40_000);
 
-  it("way C: writing the draft with the planner completes the mission and keeps the access unverified", () => {
+  it("opens the real thesis document from the planner instead of completing checklist steps", () => {
     const rig = mountLayer();
     fireEvent.click(screen.getByTestId("hud-planner-chip"));
     const planner = screen.getByTestId("planner-overlay");
-    fireEvent.click(within(planner).getByTestId("thesis-task-draft.intro-review"));
-    fireEvent.click(within(planner).getByTestId("thesis-task-draft.findings"));
-    fireEvent.click(within(planner).getByTestId("thesis-task-draft.final"));
-    const state = rig.store().getState();
-    expect(state.resources.thesisProgress).toBe(67);
-    expect(state.world.missions["m01.missing-access"].status).toBe("completed");
-    expect(state.persistent.schoolAccessVerified).toBe(false);
-    expect(state.resources.cash).toBe(2_500_000);
+    const before = rig.store().getState();
+    fireEvent.click(within(planner).getByTestId("thesis-open-document"));
+    const laptop = screen.getByTestId("laptop-desktop");
+    fireEvent.click(within(laptop).getByTestId("desktop-icon-thesis"));
+    expect(within(laptop).getByTestId("thesis-document-editor")).toBeTruthy();
+    expect(rig.store().getState().resources.thesisProgress).toBe(before.resources.thesisProgress);
+    expect(rig.store().getState().world.missions["m01.missing-access"].status).not.toBe("completed");
+    expect(rig.store().getState().persistent.schoolAccessVerified).toBe(false);
   });
 
   it("shows the email in Vietnamese with the Vietnamese amount", () => {

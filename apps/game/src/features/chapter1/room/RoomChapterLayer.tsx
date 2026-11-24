@@ -384,6 +384,8 @@ const RoomChapterLayerView: React.FC<RoomChapterLayerProps> = ({
 
   // Created once per mount: a fresh chapter or the state replayed by the loader.
   const [store] = useState(() => createChapterStore(session.restored?.state ?? createInitialState(ACTIVE_SCENARIO), ACTIVE_SCENARIO));
+  // The document editor unmounts when another laptop app opens; keep its in-progress and saved text for this run.
+  const thesisDocumentDraft = useRef<{ content: Record<string, string>; savedContent: Record<string, string> }>({ content: {}, savedContent: {} });
   const onStoreReadyRef = useRef(onStoreReady);
   onStoreReadyRef.current = onStoreReady;
   useEffect(() => {
@@ -960,12 +962,17 @@ const RoomChapterLayerView: React.FC<RoomChapterLayerProps> = ({
     tasks: thesisView.tasks,
     onWork: (minutes, focusMode) => void store.dispatch({ type: "WORK_ON_THESIS", minutes, focusMode }),
     onTask: (taskId) => void store.dispatch({ type: "COMPLETE_THESIS_TASK", taskId }),
+    onOpenDocument: () => {
+      closePlanner();
+      openOverlay({ kind: "laptop" });
+    },
     deepWork: !legacyLaptop
       ? {
           state: narrativeState,
           scenario,
           baseMinutesPerPercent: gameplay.thesisMinutesPerPercent,
           fatigueConfig: gameplay.fatigue,
+          documentDraft: thesisDocumentDraft,
           onPreviewMinutesOffset: setThesisClockPreviewOffset,
         }
       : undefined,

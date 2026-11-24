@@ -1,5 +1,4 @@
-// The laptop's Thesis window: a full-width, zero-scroll 2-column interactive Word & Research Desk
-// canvas ("Draft · Stamp · Proofread") framing Alex's living thesis manuscript and evidence tray.
+// The laptop's Thesis window: Alex's manuscript editor, supervisor comments and working research notes.
 import React from "react";
 import { ThesisPanel, type ThesisPanelProps } from "../../../world/ThesisPanel";
 
@@ -16,12 +15,12 @@ export const ThesisWindow: React.FC<Omit<ThesisPanelProps, "tone">> = (props) =>
     >
       <div className="flex items-center gap-2 font-mono font-semibold text-[#1e3a8a]">
         <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
-        <span>Alex_Thesis_Final_Ch3.docx</span>
+        <span>thesis-draft.docx</span>
       </div>
       <div className="flex items-center gap-2 text-[10px] text-[#64748b]">
-        <span>Draft · Stamp · Proofread</span>
+        <span>Chapter 3 · Working draft</span>
         <span>·</span>
-        <span>Autosave ON</span>
+        <span>Local draft</span>
       </div>
     </div>
 
